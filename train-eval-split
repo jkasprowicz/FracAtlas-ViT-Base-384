@@ -1,0 +1,388 @@
+# full_evaluation_vit_final.py
+import os
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, roc_curve, precision_recall_curve, confusion_matrix,
+    classification_report
+)
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import timm
+from torch.amp import autocast, GradScaler
+import subprocess
+import datetime
+import random
+
+# --------------------------
+# CONFIG (ajuste conforme necessário)
+# --------------------------
+BASE = Path("/lapix/FracAtlas/FracAtlas")      # ajuste se necessário
+IMAGE_DIR = BASE / "images"
+RESULTS_DIR = BASE / "results_vit_final"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+(RESULTS_DIR / "images").mkdir(exist_ok=True)
+DEVICE_LOG = RESULTS_DIR / "device.txt"
+
+CLASSES = ["Fractured", "Non_fractured"]
+NC = len(CLASSES)
+IMG_SIZE = (384, 384)
+BATCH_SIZE = 8
+NUM_EPOCHS = 50          # você pode aumentar para 80-150 se quiser (há early stopping)
+SEED = 42
+FONTSIZE = 18
+EARLYSTOP_PATIENCE = 7   # early stopping no val_f1
+
+# reproducibility (best effort)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+# --------------------------
+# util: pick free gpu
+# --------------------------
+def pick_free_gpu():
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        free_mem = [int(x) for x in result.stdout.decode().split('\n') if x.strip()]
+        return free_mem.index(max(free_mem))
+    except Exception:
+        return None
+
+gpu_id = pick_free_gpu()
+device = torch.device(f"cuda:{gpu_id}" if gpu_id is not None and torch.cuda.is_available() else "cpu")
+with open(DEVICE_LOG, "w") as f:
+    f.write(f"{datetime.datetime.now().isoformat()}  Device: {device}\n")
+print("Using device:", device)
+
+# --------------------------
+# Dataset (robusto)
+# --------------------------
+class FracAtlasDataset(Dataset):
+    def __init__(self, images, labels, transform=None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except (UnidentifiedImageError, OSError):
+            alt_idx = (idx + 1) % len(self.images)
+            return self.__getitem__(alt_idx)
+
+        if self.transform:
+            img = self.transform(img)
+        label = self.labels[idx]
+        return img, label, str(img_path)
+
+# --------------------------
+# Carregar imagens (filtrando .ipynb_checkpoints)
+# --------------------------
+VALID_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
+all_images = []
+all_labels = []
+for i, cls in enumerate(CLASSES):
+    folder = IMAGE_DIR / cls
+    files = [p for p in sorted(folder.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXT and not p.name.startswith(".")]
+    print(f"Found {len(files)} images for class {cls}")
+    all_images.extend([str(p) for p in files])
+    all_labels.extend([i] * len(files))
+
+# --------------------------
+# FIXED stratified split (important)
+# --------------------------
+train_imgs, val_imgs, train_labels, val_labels = train_test_split(
+    all_images, all_labels, test_size=0.2, random_state=SEED, stratify=all_labels
+)
+
+# --------------------------
+# Augmentations & transforms
+# --------------------------
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
+    transforms.RandomHorizontalFlip(p=0.5),   # remover se clinicamente inválido
+    transforms.RandomRotation(12),
+    transforms.ColorJitter(brightness=0.06, contrast=0.06),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+])
+
+train_dataset = FracAtlasDataset(train_imgs, train_labels, transform=train_transform)
+val_dataset = FracAtlasDataset(val_imgs, val_labels, transform=val_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+# --------------------------
+# Model, optimizer, scaler
+# --------------------------
+model = timm.create_model("vit_base_patch16_384", pretrained=True)
+model.head = nn.Linear(model.head.in_features, NC)
+model = model.to(device)
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+scaler = GradScaler()
+
+# --------------------------
+# FOCAL LOSS (multiclass-friendly)
+# --------------------------
+import torch.nn.functional as F
+def focal_loss(logits, targets, gamma=2.0, alpha=None, reduction='mean'):
+    """
+    logits: (B, C) raw outputs
+    targets: (B,) long
+    alpha: None or list/torch.tensor with shape (C,) for class balancing
+    """
+    ce = F.cross_entropy(logits, targets, reduction='none')  # per-sample CE
+    pt = torch.exp(-ce)  # p_t
+    loss = (1 - pt) ** gamma * ce
+    if alpha is not None:
+        # apply class-wise alpha
+        if not isinstance(alpha, torch.Tensor):
+            alpha_t = torch.tensor(alpha, device=logits.device, dtype=torch.float32)
+        else:
+            alpha_t = alpha.to(logits.device).float()
+        at = alpha_t[targets]  # (B,)
+        loss = at * loss
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
+
+# Option: small alpha to slightly favor minority (you can tune)
+# compute basic class frequencies to derive alpha (optional)
+counts = np.bincount(np.array(all_labels))
+alpha = (counts.sum() / (counts + 1e-12))
+alpha = alpha / alpha.sum()
+alpha = torch.tensor(alpha, dtype=torch.float32).to(device)
+print("Focal alpha (class priors scaled):", alpha.cpu().numpy())
+
+# --------------------------
+# Training helpers: early stopping
+# --------------------------
+best_f1 = 0.0
+best_epoch = -1
+no_improve = 0
+history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_prec": [], "val_rec": [], "val_f1": []}
+
+# save config
+with open(RESULTS_DIR / "training_config.txt", "w") as f:
+    f.write(f"IMG_SIZE={IMG_SIZE}\nBATCH_SIZE={BATCH_SIZE}\nNUM_EPOCHS={NUM_EPOCHS}\nSEED={SEED}\nEARLYSTOP_PATIENCE={EARLYSTOP_PATIENCE}\n")
+
+# --------------------------
+# Training loop
+# --------------------------
+for epoch in range(1, NUM_EPOCHS + 1):
+    model.train()
+    train_losses = []
+
+    for imgs, labels, _ in train_loader:
+        imgs = imgs.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        with autocast(device_type="cuda" if device.type=="cuda" else "cpu"):
+            logits = model(imgs)
+            loss = focal_loss(logits, labels, gamma=2.0, alpha=alpha, reduction='mean')
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        train_losses.append(loss.item())
+
+    # validation
+    model.eval()
+    val_preds, val_trues, val_probs = [], [], []
+    val_losses = []
+
+    with torch.no_grad():
+        for imgs, labels, _ in val_loader:
+            imgs = imgs.to(device)
+            labels = labels.to(device)
+            with autocast(device_type="cuda" if device.type=="cuda" else "cpu"):
+                logits = model(imgs)
+                loss = focal_loss(logits, labels, gamma=2.0, alpha=alpha, reduction='mean')
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds = np.argmax(probs, axis=1)
+            val_preds.extend(preds.tolist())
+            val_trues.extend(labels.cpu().numpy().tolist())
+            val_probs.extend(probs.tolist())
+            val_losses.append(loss.item())
+
+    val_acc = accuracy_score(val_trues, val_preds)
+    val_prec = precision_score(val_trues, val_preds, zero_division=0)
+    val_rec = recall_score(val_trues, val_preds, zero_division=0)
+    val_f1 = f1_score(val_trues, val_preds, zero_division=0)
+
+    history["train_loss"].append(np.mean(train_losses) if train_losses else 0.0)
+    history["val_loss"].append(np.mean(val_losses) if val_losses else 0.0)
+    history["val_acc"].append(val_acc)
+    history["val_prec"].append(val_prec)
+    history["val_rec"].append(val_rec)
+    history["val_f1"].append(val_f1)
+
+    print(f"Epoch {epoch}/{NUM_EPOCHS}  TrainLoss={history['train_loss'][-1]:.4f}  ValAcc={val_acc:.4f}  ValF1={val_f1:.4f}")
+
+    scheduler.step()
+
+    # checkpoint best by F1
+    if val_f1 > best_f1:
+        best_f1 = val_f1
+        best_epoch = epoch
+        no_improve = 0
+        torch.save(model.state_dict(), str(RESULTS_DIR / "vit_fracatlas_best.pth"))
+        print("Saved best model (F1 improved).")
+    else:
+        no_improve += 1
+
+    # save last
+    torch.save(model.state_dict(), str(RESULTS_DIR / "vit_fracatlas_last.pth"))
+
+    if no_improve >= EARLYSTOP_PATIENCE:
+        print(f"No improvement for {EARLYSTOP_PATIENCE} epochs — early stopping at epoch {epoch}.")
+        break
+
+# save history
+pd.DataFrame(history).to_csv(RESULTS_DIR / "training_history.csv", index=False)
+
+# --------------------------
+# Final evaluation and artifacts (same as before)
+# --------------------------
+model.load_state_dict(torch.load(RESULTS_DIR / "vit_fracatlas_best.pth", map_location=device))
+model.to(device)
+model.eval()
+
+filenames, true_labels, pred_labels, pred_confidences, probabilities = [], [], [], [], []
+
+with torch.no_grad():
+    for imgs, labels, paths in val_loader:
+        imgs = imgs.to(device)
+        logits = model(imgs)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        preds = np.argmax(probs, axis=1)
+        for pth, t, pr, pf in zip(paths, labels.cpu().numpy(), preds, probs):
+            filenames.append(pth)
+            true_labels.append(int(t))
+            pred_labels.append(int(pr))
+            pred_confidences.append(float(np.max(pf)))
+            probabilities.append(pf)
+
+pred_df = pd.DataFrame({
+    "filename": filenames,
+    "true": [CLASSES[i] for i in true_labels],
+    "pred": [CLASSES[i] for i in pred_labels],
+    "confidence": pred_confidences
+})
+pred_df.to_csv(RESULTS_DIR / "predictions.csv", index=False)
+
+report = classification_report(true_labels, pred_labels, target_names=CLASSES, zero_division=0)
+with open(RESULTS_DIR / "classification_report.txt", "w") as f:
+    f.write(report)
+print("Classification report:\n", report)
+
+# confusion matrix
+cm = confusion_matrix(true_labels, pred_labels)
+fig, ax = plt.subplots(figsize=(6,6))
+im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+ax.set_title("Confusion matrix")
+tick_marks = np.arange(len(CLASSES))
+ax.set_xticks(tick_marks); ax.set_yticks(tick_marks)
+ax.set_xticklabels(CLASSES, rotation=45); ax.set_yticklabels(CLASSES)
+thresh = cm.max() / 2.
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        ax.text(j, i, format(cm[i, j], 'd'),
+                ha="center", va="center",
+                color="white" if cm[i, j] > thresh else "black")
+fig.colorbar(im)
+plt.tight_layout()
+plt.savefig(RESULTS_DIR / "confusion_matrix.png")
+plt.close(fig)
+
+# ROC & PR (binary)
+pos_index = CLASSES.index("Fractured")
+y_true = np.array([1 if t == pos_index else 0 for t in true_labels])
+y_scores = np.array([prob[pos_index] for prob in probabilities])
+try:
+    auc = roc_auc_score(y_true, y_scores)
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    precision, recall, _ = precision_recall_curve(y_true, y_scores)
+
+    fig, ax = plt.subplots(1,2, figsize=(12,5))
+    ax[0].plot(fpr, tpr, label=f"AUC={auc:.3f}")
+    ax[0].plot([0,1],[0,1],"--", color="gray")
+    ax[0].set_title("ROC Curve")
+    ax[0].set_xlabel("FPR"); ax[0].set_ylabel("TPR"); ax[0].legend()
+
+    ax[1].plot(recall, precision)
+    ax[1].set_title("Precision-Recall Curve")
+    ax[1].set_xlabel("Recall"); ax[1].set_ylabel("Precision")
+
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "roc_pr_curves.png")
+    plt.close(fig)
+except Exception as e:
+    print("Could not compute ROC/AUC:", e)
+
+# Loss & metrics plot
+fig, ax = plt.subplots(2,1, figsize=(8,10))
+ax[0].plot(history["train_loss"], label="train_loss")
+ax[0].plot(history["val_loss"], label="val_loss")
+ax[0].set_title("Loss")
+ax[0].legend()
+ax[1].plot(history["val_acc"], label="val_acc")
+ax[1].plot(history["val_prec"], label="val_prec")
+ax[1].plot(history["val_rec"], label="val_rec")
+ax[1].plot(history["val_f1"], label="val_f1")
+ax[1].set_title("Validation metrics")
+ax[1].legend()
+plt.tight_layout()
+plt.savefig(RESULTS_DIR / "loss_metrics.png")
+plt.close(fig)
+
+# Annotate validation images (Pillow >=10 compatible)
+try:
+    font = ImageFont.truetype("DejaVuSans-Bold.ttf", FONTSIZE)
+except:
+    font = ImageFont.load_default()
+
+for i, row in pred_df.iterrows():
+    try:
+        img = Image.open(row["filename"]).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        text = f"True: {row['true']}  Pred: {row['pred']} ({row['confidence']:.2f})"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]; text_h = bbox[3] - bbox[1]
+        draw.rectangle([0, 0, text_w + 6, text_h + 6], fill=(0, 0, 0, 160))
+        draw.text((3, 3), text, fill=(255, 255, 255), font=font)
+        outname = RESULTS_DIR / "images" / (Path(row["filename"]).stem + "_pred.jpg")
+        img.save(outname)
+    except Exception as e:
+        print("Could not annotate image:", row["filename"], e)
+
+print("All results saved to:", RESULTS_DIR)
+print(f"Best epoch (by val F1): {best_epoch}, best F1: {best_f1:.4f}")
